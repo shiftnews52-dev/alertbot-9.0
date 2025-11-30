@@ -222,6 +222,3 @@ async def get_subscribed_users_count() -> int:
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
-
-# Инициализируем БД при импорте
-asyncio.create_task(init_db())
