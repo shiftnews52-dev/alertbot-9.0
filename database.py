@@ -5,7 +5,7 @@ import time
 import asyncio
 import logging
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiosqlite
 
 from config import DB_PATH
@@ -20,281 +20,208 @@ PRAGMA cache_size=10000;
 PRAGMA temp_store=MEMORY;
 
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    invited_by INTEGER,
-    balance REAL DEFAULT 0,
-    paid INTEGER DEFAULT 0,
-    language TEXT DEFAULT 'ru',
-    created_ts INTEGER NOT NULL
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    subscription_until INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS user_pairs (
+CREATE TABLE IF NOT EXISTS tracked_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     pair TEXT NOT NULL,
-    PRIMARY KEY (user_id, pair)
+    added_at INTEGER DEFAULT (strftime('%s', 'now')),
+    UNIQUE(user_id, pair),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
-CREATE TABLE IF NOT EXISTS signals_sent (
+CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     pair TEXT NOT NULL,
     side TEXT NOT NULL,
     price REAL NOT NULL,
-    score INTEGER NOT NULL,
-    sent_ts INTEGER NOT NULL
+    confidence INTEGER NOT NULL,
+    sent_at INTEGER DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_signals_pair_ts ON signals_sent(pair, sent_ts);
-CREATE INDEX IF NOT EXISTS idx_user_pairs_user ON user_pairs(user_id);
-CREATE INDEX IF NOT EXISTS idx_users_paid ON users(paid);
+CREATE INDEX IF NOT EXISTS idx_tracked_pairs_user ON tracked_pairs(user_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_pairs_pair ON tracked_pairs(pair);
+CREATE INDEX IF NOT EXISTS idx_signals_user ON signals(user_id);
+CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair);
+CREATE INDEX IF NOT EXISTS idx_signals_sent ON signals(sent_at);
 """
 
-# ==================== DATABASE POOL ====================
-class DBPool:
-    """Пул соединений к БД"""
-    def __init__(self, path: str, pool_size: int = 5):
-        self.path = path
-        self.pool_size = pool_size
-        self._pool: List[aiosqlite.Connection] = []
-        self._available = asyncio.Queue()
-        self._initialized = False
-    
-    async def init(self):
-        if self._initialized:
-            return
-        
-        for _ in range(self.pool_size):
-            conn = await aiosqlite.connect(self.path)
-            conn.row_factory = aiosqlite.Row
-            self._pool.append(conn)
-            await self._available.put(conn)
-        
-        conn = await self.acquire()
-        try:
-            await conn.executescript(INIT_SQL)
-            await conn.commit()
-        finally:
-            await self.release(conn)
-        
-        self._initialized = True
-        logger.info(f"Database pool initialized with {self.pool_size} connections")
-    
-    async def acquire(self) -> aiosqlite.Connection:
-        return await self._available.get()
-    
-    async def release(self, conn: aiosqlite.Connection):
-        await self._available.put(conn)
-    
-    async def close(self):
-        for conn in self._pool:
-            await conn.close()
+# ==================== БАЗА ДАННЫХ ====================
 
-# Глобальный пул
-db_pool = DBPool(DB_PATH, pool_size=5)
-
-# ==================== USER FUNCTIONS ====================
-async def get_user_lang(uid: int) -> str:
-    """Получить язык пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT language FROM users WHERE id=?", (uid,))
-        row = await cursor.fetchone()
-        return row["language"] if row and row["language"] else "ru"
-    finally:
-        await db_pool.release(conn)
-
-async def set_user_lang(uid: int, lang: str):
-    """Установить язык пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("UPDATE users SET language=? WHERE id=?", (lang, uid))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-async def is_paid(uid: int) -> bool:
-    """Проверить оплачен ли доступ"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT paid FROM users WHERE id=?", (uid,))
-        row = await cursor.fetchone()
-        return bool(row and row["paid"])
-    finally:
-        await db_pool.release(conn)
-
-async def get_user_balance(uid: int) -> float:
-    """Получить баланс пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT balance FROM users WHERE id=?", (uid,))
-        row = await cursor.fetchone()
-        return row["balance"] if row else 0.0
-    finally:
-        await db_pool.release(conn)
-
-async def get_user_refs_count(uid: int) -> int:
-    """Получить количество рефералов"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute(
-            "SELECT COUNT(*) as cnt FROM users WHERE invited_by=? AND paid=1",
-            (uid,)
-        )
-        row = await cursor.fetchone()
-        return row["cnt"] if row else 0
-    finally:
-        await db_pool.release(conn)
-
-# ==================== PAIRS FUNCTIONS ====================
-async def get_user_pairs(uid: int) -> List[str]:
-    """Получить пары пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT pair FROM user_pairs WHERE user_id=?", (uid,))
-        rows = await cursor.fetchall()
-        return [r["pair"] for r in rows]
-    finally:
-        await db_pool.release(conn)
-
-async def add_user_pair(uid: int, pair: str):
-    """Добавить пару пользователю"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("INSERT OR IGNORE INTO user_pairs(user_id, pair) VALUES(?,?)", (uid, pair.upper()))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-async def remove_user_pair(uid: int, pair: str):
-    """Удалить пару у пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("DELETE FROM user_pairs WHERE user_id=? AND pair=?", (uid, pair.upper()))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-async def clear_user_pairs(uid: int):
-    """Очистить все пары пользователя"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("DELETE FROM user_pairs WHERE user_id=?", (uid,))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-async def get_all_tracked_pairs() -> List[str]:
-    """Получить все отслеживаемые пары"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT DISTINCT pair FROM user_pairs")
-        rows = await cursor.fetchall()
-        return [r["pair"] for r in rows]
-    finally:
-        await db_pool.release(conn)
-
-async def get_pairs_with_users():
-    """Получить пары с пользователями (для рассылки сигналов)"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute(
-            "SELECT up.user_id, up.pair FROM user_pairs up "
-            "JOIN users u ON up.user_id = u.id WHERE u.paid = 1"
-        )
-        rows = await cursor.fetchall()
-        return rows
-    finally:
-        await db_pool.release(conn)
-
-# ==================== SIGNALS FUNCTIONS ====================
-async def count_signals_today(pair: str) -> int:
-    """Подсчитать сигналы за сегодня"""
-    conn = await db_pool.acquire()
-    try:
-        today_start = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
-        cursor = await conn.execute(
-            "SELECT COUNT(*) as cnt FROM signals_sent WHERE pair=? AND sent_ts >= ?",
-            (pair, today_start)
-        )
-        row = await cursor.fetchone()
-        return row["cnt"] if row else 0
-    finally:
-        await db_pool.release(conn)
-
-async def log_signal(uid: int, pair: str, side: str, price: float, score: int):
-    """Записать отправленный сигнал"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute(
-            "INSERT INTO signals_sent(user_id, pair, side, price, score, sent_ts) VALUES(?,?,?,?,?,?)",
-            (uid, pair, side, price, score, int(time.time()))
-        )
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-# ==================== ADMIN FUNCTIONS ====================
-async def get_users_count() -> int:
-    """Получить общее количество пользователей"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT COUNT(*) as cnt FROM users")
-        row = await cursor.fetchone()
-        return row["cnt"] if row else 0
-    finally:
-        await db_pool.release(conn)
-
-async def get_paid_users_count() -> int:
-    """Получить количество оплативших"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT COUNT(*) as cnt FROM users WHERE paid=1")
-        row = await cursor.fetchone()
-        return row["cnt"] if row else 0
-    finally:
-        await db_pool.release(conn)
-
-async def get_active_users_count() -> int:
-    """Получить количество активных (с парами)"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM user_pairs")
-        row = await cursor.fetchone()
-        return row["cnt"] if row else 0
-    finally:
-        await db_pool.release(conn)
-
-async def get_all_user_ids() -> List[int]:
-    """Получить ID всех пользователей"""
-    conn = await db_pool.acquire()
-    try:
-        cursor = await conn.execute("SELECT id FROM users")
-        rows = await cursor.fetchall()
-        return [r["id"] for r in rows]
-    finally:
-        await db_pool.release(conn)
-
-async def grant_access(uid: int):
-    """Выдать доступ пользователю"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("INSERT OR IGNORE INTO users(id, created_ts) VALUES(?,?)", (uid, int(time.time())))
-        await conn.execute("UPDATE users SET paid=1 WHERE id=?", (uid,))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-async def add_balance(uid: int, amount: float):
-    """Добавить баланс пользователю"""
-    conn = await db_pool.acquire()
-    try:
-        await conn.execute("INSERT OR IGNORE INTO users(id, created_ts) VALUES(?,?)", (uid, int(time.time())))
-        await conn.execute("UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id=?", (amount, uid))
-        await conn.commit()
-    finally:
-        await db_pool.release(conn)
-
-# ==================== INIT ====================
 async def init_db():
     """Инициализация базы данных"""
-    await db_pool.init()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(INIT_SQL)
+        await db.commit()
+    logger.info("✅ Database initialized")
+
+# ==================== ПОЛЬЗОВАТЕЛИ ====================
+
+async def add_user(user_id: int, username: str = None):
+    """Добавить пользователя"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
+            (user_id, username)
+        )
+        await db.commit()
+
+async def get_user_subscription(user_id: int) -> int:
+    """Получить дату окончания подписки (timestamp)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT subscription_until FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def update_subscription(user_id: int, days: int):
+    """Обновить подписку (добавить дни)"""
+    current_time = int(time.time())
+    
+    # Получаем текущую подписку
+    current_sub = await get_user_subscription(user_id)
+    
+    # Если подписка активна, добавляем к ней, иначе от текущего времени
+    if current_sub > current_time:
+        new_sub = current_sub + (days * 86400)
+    else:
+        new_sub = current_time + (days * 86400)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Добавляем пользователя если его нет
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            (user_id,)
+        )
+        # Обновляем подписку
+        await db.execute(
+            "UPDATE users SET subscription_until = ? WHERE user_id = ?",
+            (new_sub, user_id)
+        )
+        await db.commit()
+    
+    logger.info(f"✅ User {user_id} subscription updated: +{days} days")
+
+async def is_user_subscribed(user_id: int) -> bool:
+    """Проверить активна ли подписка"""
+    sub_until = await get_user_subscription(user_id)
+    current_time = int(time.time())
+    return sub_until > current_time
+
+# ==================== ОТСЛЕЖИВАЕМЫЕ ПАРЫ ====================
+
+async def get_user_pairs(user_id: int) -> List[str]:
+    """Получить все пары пользователя"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT pair FROM tracked_pairs WHERE user_id = ? ORDER BY added_at",
+            (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+async def add_tracked_pair(user_id: int, pair: str) -> bool:
+    """Добавить пару для отслеживания"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO tracked_pairs (user_id, pair) VALUES (?, ?)",
+                (user_id, pair)
+            )
+            await db.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False  # Уже есть
+
+async def remove_tracked_pair(user_id: int, pair: str) -> bool:
+    """Удалить пару из отслеживания"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM tracked_pairs WHERE user_id = ? AND pair = ?",
+            (user_id, pair)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def get_all_tracked_pairs() -> List[str]:
+    """Получить все уникальные отслеживаемые пары"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT pair FROM tracked_pairs") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+async def get_pairs_with_users():
+    """Получить пары с пользователями которые их отслеживают"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT tp.pair, tp.user_id 
+            FROM tracked_pairs tp
+            JOIN users u ON tp.user_id = u.user_id
+            WHERE u.subscription_until > strftime('%s', 'now')
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [{"pair": row[0], "user_id": row[1]} for row in rows]
+
+# ==================== СИГНАЛЫ ====================
+
+async def count_signals_today(pair: str) -> int:
+    """Подсчитать количество сигналов сегодня для пары"""
+    today_start = int(time.time()) - 86400  # 24 часа назад
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM signals WHERE pair = ? AND sent_at > ?",
+            (pair, today_start)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def log_signal(user_id: int, pair: str, side: str, price: float, confidence: int):
+    """Записать отправленный сигнал"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO signals (user_id, pair, side, price, confidence) VALUES (?, ?, ?, ?, ?)",
+            (user_id, pair, side, price, confidence)
+        )
+        await db.commit()
+
+# ==================== СТАТИСТИКА ====================
+
+async def get_all_user_ids() -> List[int]:
+    """Получить все ID пользователей"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+async def get_users_count() -> int:
+    """Получить количество пользователей"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def get_subscribed_users_count() -> int:
+    """Получить количество пользователей с активной подпиской"""
+    current_time = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE subscription_until > ?",
+            (current_time,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+# Инициализируем БД при импорте
+asyncio.create_task(init_db())
