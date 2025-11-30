@@ -9,6 +9,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from config import BOT_TOKEN, TIMEFRAME, CANDLE_SECONDS, CHECK_INTERVAL, SIGNAL_COOLDOWN, MIN_CONFIDENCE_SCORE, MIN_VOLUME_MULTIPLIER, MIN_VOLATILITY
 from handlers import setup_handlers
 from tasks import price_collector, signal_analyzer
+from database import init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,9 @@ print("=" * 60)
 
 async def main():
     """Основная функция запуска бота"""
+    # Инициализируем базу данных
+    await init_db()
+    
     bot = Bot(token=BOT_TOKEN, parse_mode='HTML')
     storage = MemoryStorage()
     dp = Dispatcher(bot, storage=storage)
